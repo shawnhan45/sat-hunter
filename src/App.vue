@@ -171,7 +171,7 @@
             <p v-if="keyStorageError && currentBaseMap === 'tianditu'" class="text-xs text-amber-600">{{ keyStorageError }}</p>
             <label class="block mt-3 text-sm">文件格式
               <select v-model="fileFormat" :disabled="isDownloading" class="border dark:bg-gray-800">
-                <option value="png">PNG</option><option value="tif">GeoTIFF（含坐标）</option>
+                <option value="png">PNG</option><option value="tif">GeoTIFF（WGS84 经纬度）</option>
               </select>
             </label>
             <label v-if="fileFormat === 'tif'" class="block mt-2 text-sm">
@@ -710,7 +710,6 @@
 
   function geoTiff(ctx: CanvasRenderingContext2D, left: number, top: number, z: number, correct: boolean) {
     const w = ctx.canvas.width, h = ctx.canvas.height, world = 256 * 2**z;
-    const half = Math.PI * 6378137, res = 2 * half / world;
     // Offset in global XYZ pixels at a WGS84 pixel position.
     function shift(px: number, py: number) {
       const lon = px/world*360-180;
@@ -736,7 +735,18 @@
       bound(w,h); ox=Math.floor(xmin)-1; oy=Math.floor(ymin)-1;
       width=Math.ceil(xmax)-ox+1; height=Math.ceil(ymax)-oy+1;
     }
-    // Little-endian baseline RGBA TIFF, PixelIsArea, EPSG:3857.
+    // ArcMap 10.2 misreads the minimalist EPSG:3857 GeoTIFF as ellipsoidal Mercator.
+    // Export a regular EPSG:4326 grid and sample each row at its geographic pixel center.
+    const latitudeAt = (py: number) =>
+      Math.atan(Math.sinh(Math.PI * (1 - 2 * py / world))) * 180 / Math.PI;
+    const west = ox * 360 / world - 180;
+    const north = latitudeAt(oy);
+    const degreesX = 360 / world;
+    const degreesY = (north - latitudeAt(oy + height)) / height;
+    function sourceWorldY(outputRow: number) {
+      const lat = (north - (outputRow + 0.5) * degreesY) * Math.PI / 180;
+      return (1 - Math.asinh(Math.tan(lat)) / Math.PI) * world / 2;
+    }
     const tags = 14, extras = 8+2+tags*12+4, bits = extras, scale=bits+8;
     const tie=scale+24, keys=tie+48, raster=keys+32;
     const header=new ArrayBuffer(raster), v=new DataView(header);
@@ -756,15 +766,20 @@
     tag(338,3,1,2);
     tag(33550,12,3,scale);tag(33922,12,6,tie);tag(34735,3,16,keys);
     [8,8,8,8].forEach((n,i)=>u16(bits+2*i,n));
-    dbl(scale,res);dbl(scale+8,res);dbl(tie+24,ox*res-half);dbl(tie+32,half-oy*res);
-    [1,1,0,3,1024,0,1,1,1025,0,1,1,3072,0,1,3857].forEach((n,i)=>u16(keys+i*2,n));
+    dbl(scale,degreesX);dbl(scale+8,degreesY);dbl(tie+24,west);dbl(tie+32,north);
+    [1,1,0,3,1024,0,1,2,1025,0,1,1,2048,0,1,4326].forEach((n,i)=>u16(keys+i*2,n));
     const parts: BlobPart[]=[header];
     for(let y=0;y<height;y+=64){
       const rows=Math.min(64,height-y);
-      if(!correct){parts.push(new Uint8Array(ctx.getImageData(0,y,w,rows).data).buffer);continue;}
+
       const block=new Uint8Array(width*rows*4);
       for(let r=0;r<rows;r++){
-        const py=oy+y+r+0.5;
+        const py=sourceWorldY(y+r);
+        if (!correct) {
+          const sourceRow = Math.min(h - 1, Math.max(0, Math.floor(py - top)));
+          block.set(ctx.getImageData(0, sourceRow, w, 1).data, r * width * 4);
+          continue;
+        }
         const nodes=[];
         for(let x=0;x<width+16;x+=16) nodes.push(shift(ox+x+0.5,py));
         const ys=nodes.map(d=>Math.floor(py+d.y-top));
