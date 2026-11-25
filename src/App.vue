@@ -165,6 +165,10 @@
               天地图密钥（tk）
               <input v-model.lazy.trim="tiandituKey" type="password" placeholder="输入后按回车或点击空白处" @keyup.enter="($event.target as HTMLInputElement).blur()" class="w-full border p-1 dark:bg-gray-800" />
             </label>
+            <label v-if="currentBaseMap === 'tianditu'" class="block mt-2 text-sm">
+              <input type="checkbox" v-model="rememberKey" /> 在此浏览器记住密钥
+            </label>
+            <p v-if="keyStorageError && currentBaseMap === 'tianditu'" class="text-xs text-amber-600">{{ keyStorageError }}</p>
             <label class="block mt-3 text-sm">文件格式
               <select v-model="fileFormat" :disabled="isDownloading" class="border dark:bg-gray-800">
                 <option value="png">PNG</option><option value="tif">GeoTIFF（含坐标）</option>
@@ -308,7 +312,21 @@
     localStorage.setItem("theme", newState ? "dark" : "light");
   };
 
-  const tiandituKey = ref("");
+  const keyStorageName = "sat-hunter:tianditu-browser-key";
+  let savedKey = "";
+  try { savedKey = localStorage.getItem(keyStorageName) || ""; } catch { /* Storage can be disabled. */ }
+  const tiandituKey = ref(savedKey);
+  const rememberKey = ref(Boolean(savedKey));
+  const keyStorageError = ref("");
+  watch([rememberKey, tiandituKey], ([remember, key]) => {
+    try {
+      if (remember && key) localStorage.setItem(keyStorageName, key);
+      else localStorage.removeItem(keyStorageName);
+      keyStorageError.value = "";
+    } catch {
+      keyStorageError.value = "浏览器未允许更新保存的密钥，可在站点设置中管理数据。";
+    }
+  });
   const googleTiles = "https://mt0.google.com/vt?hl=zh-CN&x={x}&y={y}&z={z}&lyrs=";
   function tiandituTiles(layer: "img" | "cia") {
     return "https://t0.tianditu.gov.cn/" + layer + "_w/wmts?SERVICE=WMTS&REQUEST=GetTile&VERSION=1.0.0&STYLE=default&TILEMATRIXSET=w&FORMAT=tiles&TILEMATRIX={z}&TILEROW={y}&TILECOL={x}&LAYER=" + layer + "&tk=" + encodeURIComponent(tiandituKey.value);
