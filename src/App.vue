@@ -161,7 +161,20 @@
                 {{ option.name }}
               </button>
             </div>
-            <label v-if="currentBaseMap === 'gaode_vector'" class="block mt-3 text-sm">高德导出内容
+            <label v-if="currentBaseMap === 'tianditu'" class="block mt-3 text-sm">
+              天地图密钥（tk）
+              <input v-model.lazy.trim="tiandituKey" type="password" placeholder="输入后按回车或点击空白处" @keyup.enter="($event.target as HTMLInputElement).blur()" class="w-full border p-1 dark:bg-gray-800" />
+            </label>
+            <label class="block mt-3 text-sm">文件格式
+              <select v-model="fileFormat" :disabled="isDownloading" class="border dark:bg-gray-800">
+                <option value="png">PNG</option><option value="tif">GeoTIFF（含坐标）</option>
+              </select>
+            </label>
+            <label v-if="fileFormat === 'tif'" class="block mt-2 text-sm">
+              <input type="checkbox" v-model="correctGcj" :disabled="isDownloading" />
+              中国大陆 GCJ-02 图源近似纠偏
+            </label>
+            <label v-if="activeLabels" class="block mt-3 text-sm">导出内容
               <select v-model="mode" :disabled="isDownloading" class="border dark:bg-gray-800">
                 <option value="both">影像＋道路地名</option><option value="labels">仅透明注记</option><option value="base">仅卫星影像</option>
               </select>
@@ -173,7 +186,7 @@
       <div class="p-5 mt-auto">
         <button
           class="w-full py-3 px-4 cursor-pointer bg-blue-600 hover:bg-blue-700 text-white text-sm font-bold rounded-xl shadow-lg shadow-blue-200 disabled:bg-gray-300 disabled:text-gray-500 disabled:shadow-none disabled:cursor-not-allowed transition-all transform active:scale-[0.98] dark:shadow-blue-900/30 dark:disabled:bg-gray-700 dark:disabled:text-gray-500"
-          :disabled="!currentMode || isDownloading"
+          :disabled="!currentMode || isDownloading || (currentBaseMap === 'tianditu' && !tiandituKey)"
           @click="startDownload">
           {{ isDownloading ? `处理中 ${downloadProgress}%` : "开始下载" }}
         </button>
@@ -215,6 +228,7 @@
     | "esri_imagery_firefly"
     | "esri_imagery"
     | "gaode_vector"
+    | "tianditu"
     | "google_satellite";
 
   interface TileCoord {
@@ -294,6 +308,11 @@
     localStorage.setItem("theme", newState ? "dark" : "light");
   };
 
+  const tiandituKey = ref("");
+  const googleTiles = "https://mt0.google.com/vt?hl=zh-CN&x={x}&y={y}&z={z}&lyrs=";
+  function tiandituTiles(layer: "img" | "cia") {
+    return "https://t0.tianditu.gov.cn/" + layer + "_w/wmts?SERVICE=WMTS&REQUEST=GetTile&VERSION=1.0.0&STYLE=default&TILEMATRIXSET=w&FORMAT=tiles&TILEMATRIX={z}&TILEROW={y}&TILECOL={x}&LAYER=" + layer + "&tk=" + encodeURIComponent(tiandituKey.value);
+  }
   const baseMapOptions: BaseMapOption[] = [
     {
       id: "gaode_vector",
@@ -328,7 +347,12 @@
     {
       id: "google_satellite",
       name: "Google 卫星影像",
-      url: "http://mt0.google.com/vt/lyrs=s&hl=en&x={x}&y={y}&z={z}",
+      url: googleTiles + "s",
+    },
+    {
+      id: "tianditu",
+      name: "天地图 卫星影像",
+      get url() { return tiandituTiles("img"); },
     },
   ];
 
@@ -345,9 +369,9 @@
 
   watch(zoomLevel, () => updateEstimate());
 
-  const setBaseMap = (id: BaseMapId) => {
+  const setBaseMap = (id: BaseMapId, force = false) => {
     if (!map.value) return;
-    if (currentBaseMap.value === id && baseMapLayer.value) return;
+    if (!force && currentBaseMap.value === id && baseMapLayer.value) return;
     currentBaseMap.value = id;
     if (baseMapLayer.value) {
       map.value.removeLayer(baseMapLayer.value);
@@ -358,7 +382,7 @@
       labelLayer.value = null;
     }
     const config = baseMapOptions.find((item) => item.id === id);
-    if (!config) return;
+    if (!config || (id === "tianditu" && !tiandituKey.value)) return;
     const layer = L.tileLayer(config.url, {
       maxZoom: 19,
       crossOrigin: "anonymous",
@@ -368,14 +392,28 @@
     refreshLabels();
   };
 
+  const fileFormat = ref("png");
+  const correctGcj = ref(true);
+  watch(currentBaseMap, id => { correctGcj.value = id === "gaode_vector"; });
   const mode = ref("both");
   const labelsUrl = "https://webst01.is.autonavi.com/appmaptile?style=8&lang=zh_cn&size=1&scale=1&x={x}&y={y}&z={z}";
+  const activeLabels = computed(() => {
+    switch (currentBaseMap.value) {
+      case "gaode_vector": return labelsUrl;
+      case "google_satellite": return googleTiles + "h";
+      case "tianditu": return tiandituTiles("cia");
+      default: return "";
+    }
+  });
+  watch(tiandituKey, () => {
+    if (currentBaseMap.value === "tianditu") setBaseMap("tianditu", true);
+  });
   function refreshLabels() {
     if (!map.value) return;
     if (labelLayer.value) map.value.removeLayer(labelLayer.value);
     labelLayer.value = null;
-    if (currentBaseMap.value === "gaode_vector" && mode.value !== "base") {
-      labelLayer.value = L.tileLayer(labelsUrl, {maxZoom: 19, zIndex: 2}).addTo(map.value);
+    if (baseMapLayer.value && activeLabels.value && mode.value !== "base") {
+      labelLayer.value = L.tileLayer(activeLabels.value, {maxZoom: 19, zIndex: 2}).addTo(map.value);
     }
   }
   watch(mode, refreshLabels);
@@ -637,6 +675,98 @@
     statusText.value = `预计瓦片: ${tileCount.value} 张`;
   };
 
+  // Approximate mainland WGS84 -> GCJ-02 transform used only for explicitly selected tiles.
+  function gcjOffset(lon: number, lat: number) {
+    const x = lon - 105, y = lat - 35, p = Math.PI;
+    const wave = (v: number, n: number) => Math.sin(v * n * p);
+    const common = (20 * wave(x, 6) + 20 * wave(x, 2)) * 2 / 3;
+    const dLat = -100 + 2*x + 3*y + 0.2*y*y + 0.1*x*y + 0.2*Math.sqrt(Math.abs(x)) + common
+      + (20*wave(y,1) + 40*wave(y,1/3) + 160*wave(y,1/12) + 320*wave(y,1/30))*2/3;
+    const dLon = 300 + x + 2*y + 0.1*x*x + 0.1*x*y + 0.1*Math.sqrt(Math.abs(x)) + common
+      + (20*wave(x,1) + 40*wave(x,1/3) + 150*wave(x,1/12) + 300*wave(x,1/30))*2/3;
+    const rad = lat*p/180, e = 0.006693421622965943, axis = 6378245;
+    const m = 1 - e * Math.sin(rad)**2;
+    return {lon: dLon*180*Math.sqrt(m)/(axis*Math.cos(rad)*p),
+      lat: dLat*180*m**1.5/(axis*(1-e)*p)};
+  }
+
+  function geoTiff(ctx: CanvasRenderingContext2D, left: number, top: number, z: number, correct: boolean) {
+    const w = ctx.canvas.width, h = ctx.canvas.height, world = 256 * 2**z;
+    const half = Math.PI * 6378137, res = 2 * half / world;
+    // Offset in global XYZ pixels at a WGS84 pixel position.
+    function shift(px: number, py: number) {
+      const lon = px/world*360-180;
+      const lat = Math.atan(Math.sinh(Math.PI*(1-2*py/world)))*180/Math.PI;
+      const d = gcjOffset(lon,lat);
+      const q = project(lat+d.lat,lon+d.lon,z);
+      return {x:q.x-px,y:q.y-py};
+    }
+    let ox = left, oy = top, width = w, height = h;
+    if (correct) {
+      let xmin = Infinity, ymin = Infinity, xmax = -Infinity, ymax = -Infinity;
+      function bound(x: number, y: number) {
+        let px = left+x, py = top+y;
+        for (let i=0;i<4;i++) {
+          const d = shift(px,py);
+          px = left+x-d.x; py = top+y-d.y;
+        }
+        xmin=Math.min(xmin,px); xmax=Math.max(xmax,px);
+        ymin=Math.min(ymin,py); ymax=Math.max(ymax,py);
+      }
+      for(let x=0;x<w;x+=16){bound(x,0);bound(x,h);}
+      for(let y=0;y<h;y+=16){bound(0,y);bound(w,y);}
+      bound(w,h); ox=Math.floor(xmin)-1; oy=Math.floor(ymin)-1;
+      width=Math.ceil(xmax)-ox+1; height=Math.ceil(ymax)-oy+1;
+    }
+    // Little-endian baseline RGBA TIFF, PixelIsArea, EPSG:3857.
+    const tags = 14, extras = 8+2+tags*12+4, bits = extras, scale=bits+8;
+    const tie=scale+24, keys=tie+48, raster=keys+32;
+    const header=new ArrayBuffer(raster), v=new DataView(header);
+    const u16=(p:number,n:number)=>v.setUint16(p,n,true);
+    const u32=(p:number,n:number)=>v.setUint32(p,n,true);
+    const dbl=(p:number,n:number)=>v.setFloat64(p,n,true);
+    u16(0,0x4949);u16(2,42);u32(4,8);u16(8,tags);
+    let pos=10;
+    function tag(id:number,type:number,count:number,value:number){
+      u16(pos,id);u16(pos+2,type);u32(pos+4,count);
+      if(type===3 && count===1) u16(pos+8,value); else u32(pos+8,value);
+      pos+=12;
+    }
+    tag(256,4,1,width);tag(257,4,1,height);tag(258,3,4,bits);
+    tag(259,3,1,1);tag(262,3,1,2);tag(273,4,1,raster);tag(277,3,1,4);
+    tag(278,4,1,height);tag(279,4,1,width*height*4);tag(284,3,1,1);
+    tag(338,3,1,2);
+    tag(33550,12,3,scale);tag(33922,12,6,tie);tag(34735,3,16,keys);
+    [8,8,8,8].forEach((n,i)=>u16(bits+2*i,n));
+    dbl(scale,res);dbl(scale+8,res);dbl(tie+24,ox*res-half);dbl(tie+32,half-oy*res);
+    [1,1,0,3,1024,0,1,1,1025,0,1,1,3072,0,1,3857].forEach((n,i)=>u16(keys+i*2,n));
+    const parts: BlobPart[]=[header];
+    for(let y=0;y<height;y+=64){
+      const rows=Math.min(64,height-y);
+      if(!correct){parts.push(new Uint8Array(ctx.getImageData(0,y,w,rows).data).buffer);continue;}
+      const block=new Uint8Array(width*rows*4);
+      for(let r=0;r<rows;r++){
+        const py=oy+y+r+0.5;
+        const nodes=[];
+        for(let x=0;x<width+16;x+=16) nodes.push(shift(ox+x+0.5,py));
+        const ys=nodes.map(d=>Math.floor(py+d.y-top));
+        const lo=Math.max(0,Math.min(...ys)-1), hi=Math.min(h-1,Math.max(...ys)+1);
+        if(hi<lo) continue;
+        const source=ctx.getImageData(0,lo,w,hi-lo+1).data;
+        for(let x=0;x<width;x++){
+          const a=nodes[x>>4]!, b=nodes[(x>>4)+1]!, f=(x%16)/16;
+          const sx=Math.floor(ox+x+0.5+a.x+(b.x-a.x)*f-left);
+          const sy=Math.floor(py+a.y+(b.y-a.y)*f-top);
+          if(sx<0||sx>=w||sy<lo||sy>hi) continue;
+          const idx=((sy-lo)*w+sx)*4;
+          block.set(source.subarray(idx,idx+4),(r*width+x)*4);
+        }
+      }
+      parts.push(block.buffer);
+    }
+    return new Blob(parts,{type:"image/tiff"});
+  }
+
   const startDownload = async () => {
     let bounds: L.LatLngBounds | undefined;
     if (currentMode.value === "rect" && rectLayer.value) {
@@ -653,6 +783,10 @@
       return;
     }
 
+    const format = fileFormat.value;
+    const center = bounds.getCenter();
+    const rectify = correctGcj.value && center.lng >= 72 && center.lng <= 138 && center.lat >= 0.8 && center.lat <= 56;
+    const name = currentMode.value === "polygon" ? searchQuery.value : "terra_snap_map";
     isDownloading.value = true;
     downloadProgress.value = 0;
     statusText.value = "准备下载...";
@@ -692,9 +826,10 @@
       isDownloading.value = false;
       return;
     }
-    const output = activeBaseMap.id === "gaode_vector" ? mode.value : "base";
-    const sources = output === "both" ? [activeBaseMap.url, labelsUrl]
-      : [output === "labels" ? labelsUrl : activeBaseMap.url];
+    const overlay = activeLabels.value;
+    const output = overlay ? mode.value : "base";
+    const sources = output === "both" ? [activeBaseMap.url, overlay]
+      : [output === "labels" ? overlay : activeBaseMap.url];
     let next = 0;
     let failed = false;
     async function worker() {
@@ -777,24 +912,27 @@
         cropH,
       );
 
-      finalCanvas.toBlob((blob) => {
-        if (blob) {
-          const url = URL.createObjectURL(blob);
-          const a = document.createElement("a");
-          a.href = url;
-          const name =
-            currentMode.value === "polygon"
-              ? searchQuery.value
-              : "terra_snap_map";
-          a.download = `${name}_z${z}_${output}.png`;
-          document.body.appendChild(a);
-          a.click();
-          document.body.removeChild(a);
-          URL.revokeObjectURL(url);
-        }
-        isDownloading.value = false;
+      canvas.width = canvas.height = 0;
+      try {
+        const blob = format === "tif"
+          ? geoTiff(finalCtx, originX+cropX, originY+cropY, z, rectify)
+          : await new Promise<Blob | null>(resolve => finalCanvas.toBlob(resolve, "image/png"));
+        if (!blob) throw new Error("图片编码失败");
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement("a");
+        link.href = url;
+        link.download = `${name}_${activeBaseMap.id}_z${z}_${output}.${format}`;
+        link.click();
+        setTimeout(() => URL.revokeObjectURL(url), 60000);
         statusText.value = "下载完成";
-      }, "image/png");
+      } catch {
+        statusText.value = "导出失败，请缩小范围后重试";
+      } finally {
+        isDownloading.value = false;
+      }
+    } else {
+      isDownloading.value = false;
+      statusText.value = "无法创建输出画布";
     }
   };
 
