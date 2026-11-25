@@ -161,6 +161,11 @@
                 {{ option.name }}
               </button>
             </div>
+            <label v-if="currentBaseMap === 'gaode_vector'" class="block mt-3 text-sm">高德导出内容
+              <select v-model="mode" :disabled="isDownloading" class="border dark:bg-gray-800">
+                <option value="both">影像＋道路地名</option><option value="labels">仅透明注记</option><option value="base">仅卫星影像</option>
+              </select>
+            </label>
           </div>
         </div>
       </div>
@@ -360,8 +365,29 @@
     });
     layer.addTo(map.value);
     baseMapLayer.value = layer;
+    refreshLabels();
   };
 
+  const mode = ref("both");
+  const labelsUrl = "https://webst01.is.autonavi.com/appmaptile?style=8&lang=zh_cn&size=1&scale=1&x={x}&y={y}&z={z}";
+  function refreshLabels() {
+    if (!map.value) return;
+    if (labelLayer.value) map.value.removeLayer(labelLayer.value);
+    labelLayer.value = null;
+    if (currentBaseMap.value === "gaode_vector" && mode.value !== "base") {
+      labelLayer.value = L.tileLayer(labelsUrl, {maxZoom: 19, zIndex: 2}).addTo(map.value);
+    }
+  }
+  watch(mode, refreshLabels);
+  function loadTile(template: string, x: number, y: number, z: number): Promise<HTMLImageElement> {
+    return new Promise((resolve, reject) => {
+      const img = new Image();
+      img.crossOrigin = "anonymous";
+      img.onload = () => resolve(img);
+      img.onerror = () => reject(new Error("瓦片读取失败"));
+      img.src = template.replace("{x}", String(x)).replace("{y}", String(y)).replace("{z}", String(z));
+    });
+  }
   const loadAddressData = async () => {
     isRegionLoading.value = true;
     regionLoadError.value = "";
@@ -658,7 +684,7 @@
     }
 
     let loaded = 0;
-    const promises: Promise<void>[] = [];
+    const clipGeometry = currentMode.value === 'polygon' ? cityGeoJSON.value : null;
     const activeBaseMap =
       baseMapOptions.find((item) => item.id === currentBaseMap.value) ||
       baseMapOptions[0];
@@ -666,35 +692,36 @@
       isDownloading.value = false;
       return;
     }
-    const tileBaseUrl = activeBaseMap.url;
-
-    for (let x = minX; x <= maxX; x++) {
-      for (let y = minY; y <= maxY; y++) {
-        promises.push(
-          new Promise((resolve) => {
-            const img = new Image();
-            img.crossOrigin = "Anonymous";
-            img.src = tileBaseUrl
-              .replace("{z}", z.toString())
-              .replace("{y}", y.toString())
-              .replace("{x}", x.toString());
-
-            img.onload = () => {
-              ctx.drawImage(img, (x - minX) * 256, (y - minY) * 256);
-              loaded++;
-              downloadProgress.value = Math.floor((loaded / totalTiles) * 100);
-              resolve();
-            };
-            img.onerror = () => resolve();
-          }),
-        );
+    const output = activeBaseMap.id === "gaode_vector" ? mode.value : "base";
+    const sources = output === "both" ? [activeBaseMap.url, labelsUrl]
+      : [output === "labels" ? labelsUrl : activeBaseMap.url];
+    let next = 0;
+    let failed = false;
+    async function worker() {
+      while (next < totalTiles && !failed) {
+        const index = next++;
+        const col = index % tilesX;
+        const row = Math.floor(index / tilesX);
+        try {
+          for (const url of sources) {
+            const tile = await loadTile(url, minX + col, minY + row, z);
+            ctx!.drawImage(tile, col * 256, row * 256);
+          }
+          downloadProgress.value = Math.floor(++loaded / totalTiles * 100);
+        } catch {
+          failed = true;
+        }
       }
     }
-
-    await Promise.all(promises);
+    await Promise.all(Array.from({length: Math.min(8, totalTiles)}, worker));
+    if (failed) {
+      isDownloading.value = false;
+      statusText.value = "瓦片读取失败，请检查图源连接与跨域支持后重试。";
+      return;
+    }
 
     // 城市轮廓裁剪
-    if (currentMode.value === "polygon" && cityGeoJSON.value) {
+    if (clipGeometry) {
       statusText.value = "应用轮廓裁剪...";
       ctx.globalCompositeOperation = "destination-in";
       ctx.beginPath();
@@ -710,7 +737,7 @@
         };
       };
 
-      drawGeoJSONPath(ctx, cityGeoJSON.value, getCanvasPixel);
+      drawGeoJSONPath(ctx, clipGeometry, getCanvasPixel);
       ctx.fill();
       ctx.globalCompositeOperation = "source-over";
     }
@@ -759,7 +786,7 @@
             currentMode.value === "polygon"
               ? searchQuery.value
               : "terra_snap_map";
-          a.download = `${name}_z${z}.png`;
+          a.download = `${name}_z${z}_${output}.png`;
           document.body.appendChild(a);
           a.click();
           document.body.removeChild(a);
